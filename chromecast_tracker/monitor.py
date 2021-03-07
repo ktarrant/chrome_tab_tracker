@@ -1,43 +1,105 @@
 import pychromecast
-import cmd
 import threading
 import time
-import os
-import pathlib
-import datetime
-from copy import deepcopy
+import logging
+import pprint
+from typing import List, Dict
+
+logger = logging.getLogger(__name__)
+
+
+def get_device_info(cast: pychromecast.Chromecast) -> Dict[str, str]:
+    return {'uuid': cast.device.uuid, 'name': cast.device.friendly_name}
+
+
+def find_differences(actual: Dict, expected: Dict):
+    differences = {}
+    for key in actual:
+        actual_value = actual[key]
+        if isinstance(actual_value, dict):
+            expected_value = expected.get(key, {})
+            difference = find_differences(actual_value, expected_value)
+            if difference:
+                differences[key] = difference
+        else:
+            try:
+                expected_value = expected[key]
+                if expected_value != actual_value:
+                    differences[key] = actual_value
+            except KeyError:
+                differences[key] = actual_value
+    return differences
 
 
 class MonitorThread(threading.Thread):
     UPDATE_DEVICES_PERIOD = 10.0
+    UPDATE_STATUS_PERIOD = 1.0
 
     def __init__(self):
         super(MonitorThread, self).__init__()
         self.stop_event = threading.Event()
-        self.devices_lock = threading.Lock()
-        self._devices = []
+        self.cast_list_lock = threading.Lock()
+        self.cast_list = []
+        self.last_statuses = {}
 
-    @property
-    def devices(self):
-        with self.devices_lock:
-            return [{key: getattr(cc.device, key) for key in ["friendly_name", "uuid"]}
-                    for cc in self._devices]
+    def update_devices(self):
+        last_list = [cast.device.friendly_name for cast in self.cast_list]
+        with self.cast_list_lock:
+            self.cast_list, cast_browser = pychromecast.get_chromecasts()
+        name_list = [cast.device.friendly_name for cast in self.cast_list]
+        casts_added = [cast.device.friendly_name for cast in self.cast_list
+                       if cast.device.friendly_name not in last_list]
+        casts_removed = [name for name in last_list if name not in name_list]
+        rv = {}
+        if casts_added:
+            logger.info(f"Casts added: {casts_added}")
+            rv["added"] = casts_added
+        if casts_removed:
+            logger.info(f"Casts removed: {casts_removed}")
+            rv["removed"] = casts_removed
+        return rv
 
-    def _update_devices(self):
-        with self.devices_lock:
-            self._devices = pychromecast.get_chromecasts()
+    def update_statuses(self, retries=1):
+        cur_statuses = {}
+        with self.cast_list_lock:
+            for cast in self.cast_list:
+                for i in range(retries + 1):
+                    cast.wait()
+                    mc = cast.media_controller
+                    if mc.status.last_updated is None:
+                        continue
+                    cur_statuses[cast.device.friendly_name] = {
+                        'content_id': mc.status.content_id,
+                        'content_type': mc.status.content_type,
+                        'duration': mc.status.duration,
+                        'title': mc.status.title,
+                    }
+
+        status_changes = find_differences(cur_statuses, self.last_statuses)
+        self.last_statuses = cur_statuses
+
+        if status_changes:
+            logger.info("Updated statuses:\n" + pprint.pformat(status_changes))
+
+        return status_changes
 
     def stop(self):
         self.stop_event.set()
 
     def run(self) -> None:
         last_devices_update = None
+        last_status_update = None
         while not self.stop_event.is_set():
-            now = time.clock()
+            now = time.perf_counter()
             if (last_devices_update is None) or (
                     now - last_devices_update >= self.UPDATE_DEVICES_PERIOD):
                 last_devices_update = now
-                self._update_devices()
+                self.update_devices()
+
+            if (last_status_update is None) or (
+                    now - last_status_update >= self.UPDATE_STATUS_PERIOD):
+                last_status_update = now
+                self.update_statuses()
 
 # class MonitorShell(cmd.Cmd):
 #     intro = ('Ready to monitor chromecast and maanage recordings.\n'
@@ -126,6 +188,16 @@ class MonitorThread(threading.Thread):
 #                 self._set_active_content(cur_id, mc.status.title)
 #             time.sleep(1.0)
 #
-#
-# if __name__ == '__main__':
-#     MonitorShell().cmdloop()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+
+    thread = MonitorThread()
+    thread.start()
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        print("Stopping thread...")
+        thread.stop()

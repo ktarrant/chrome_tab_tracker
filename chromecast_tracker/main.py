@@ -21,7 +21,7 @@ def shutdown_event():
 
 @app.get("/")
 def read_root():
-    return thread.devices
+    return thread.cast_list
 
 
 @app.post("/")
